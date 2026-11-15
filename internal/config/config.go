@@ -17,7 +17,7 @@ import (
 	"syscall"
 	"time"
 
-	"go.yaml.in/yaml/v3"
+	"go.yaml.in/yaml/v4"
 
 	"github.com/Soli0222/navidrome-curator/internal/pathutil"
 )
