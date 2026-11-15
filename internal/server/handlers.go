@@ -7,11 +7,13 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Soli0222/navidrome-curator/internal/config"
+	"github.com/Soli0222/navidrome-curator/internal/cover"
 	"github.com/Soli0222/navidrome-curator/internal/index"
 	"github.com/Soli0222/navidrome-curator/internal/jobs"
 	"github.com/Soli0222/navidrome-curator/internal/library"
@@ -153,7 +155,22 @@ type dirEntry struct {
 	Ref     string   `json:"ref"`
 	IsAlbum bool     `json:"isAlbum"`
 	State   dirState `json:"state"`
+	// アルバムでないディレクトリの、下にあるアルバム。source の直下の一覧では返さない。
+	Albums []albumBrief `json:"albums,omitempty"`
+	// source の直下の一覧で、ジャケット画像を並べるためのアルバムの ref（最大4つ）。
+	Covers []string `json:"covers,omitempty"`
 }
+
+// albumBrief は、まとめて表示するアルバム。Name はまとめた先のディレクトリからの相対パス。
+type albumBrief struct {
+	Name  string   `json:"name"`
+	Path  string   `json:"path"`
+	Ref   string   `json:"ref"`
+	State dirState `json:"state"`
+}
+
+// アーティストの下に並べるアルバムの上限。
+const maxGroupedAlbums = 300
 
 type fileEntry struct {
 	Name  string `json:"name"`
@@ -282,7 +299,31 @@ func (s *Server) handleBrowse(w http.ResponseWriter, r *http.Request) {
 	}
 	wg.Wait()
 	for i := range dirs {
-		dirs[i].State = s.albumState(src.Name, dirs[i].Path, dirs[i].IsAlbum, active)
+		d := &dirs[i]
+		d.State = s.albumState(src.Name, d.Path, d.IsAlbum, active)
+		if d.IsAlbum {
+			continue
+		}
+		albums, ok := s.Index.AlbumsUnder(src.Name, d.Path)
+		if rel == "" {
+			// source の直下（アーティストの一覧）では、ジャケットを並べるための ref だけを返す。
+			for _, a := range albums[:min(4, len(albums))] {
+				d.Covers = append(d.Covers, encodeRef(a))
+			}
+			continue
+		}
+		if !ok {
+			var err error
+			if albums, err = s.Rules.FindAlbums(r.Context(), src.Path, d.Path); err != nil {
+				continue
+			}
+		}
+		for _, a := range albums[:min(maxGroupedAlbums, len(albums))] {
+			d.Albums = append(d.Albums, albumBrief{
+				Name: strings.TrimPrefix(a, d.Path+"/"), Path: a, Ref: encodeRef(a),
+				State: s.albumState(src.Name, a, true, active),
+			})
+		}
 	}
 	resp.Dirs = dirs
 
@@ -348,6 +389,72 @@ func (s *Server) handleCompare(w http.ResponseWriter, r *http.Request) {
 		resp.Libraries = append(resp.Libraries, lc)
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// --- ジャケット画像 ---
+
+// handleCover はアルバムのジャケット画像を縮小して返す。source か library のどちらかを指定する。
+func (s *Server) handleCover(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	var root string
+	switch {
+	case q.Get("source") != "":
+		src, ok := s.Config.SourceByName(q.Get("source"))
+		if !ok {
+			writeError(w, http.StatusNotFound, "unknown_source", q.Get("source"))
+			return
+		}
+		root = src.Path
+	case q.Get("library") != "":
+		lib, ok := s.Config.LibraryByName(q.Get("library"))
+		if !ok {
+			writeError(w, http.StatusNotFound, "unknown_library", q.Get("library"))
+			return
+		}
+		root = lib.Path
+	default:
+		writeError(w, http.StatusBadRequest, "bad_request", "source or library is required")
+		return
+	}
+	rel, err := decodePath(q.Get("ref"), q.Get("path"))
+	if err != nil || rel == "" {
+		writeError(w, http.StatusBadRequest, "invalid_path", "invalid path")
+		return
+	}
+	if fi, err := pathutil.CheckNoSymlink(root, rel); err != nil || !fi.IsDir() {
+		writeError(w, http.StatusNotFound, "not_found", rel)
+		return
+	}
+	size := 320
+	if v, err := strconv.Atoi(q.Get("size")); err == nil && v > 0 {
+		size = v
+	}
+	path, etag, err := s.Covers.Thumbnail(r.Context(), root, rel, cover.SnapSize(size))
+	if err != nil {
+		w.Header().Set("Cache-Control", "private, max-age=60")
+		if errors.Is(err, cover.ErrNoCover) {
+			writeError(w, http.StatusNotFound, "no_cover", rel)
+			return
+		}
+		s.Log.Warn("cover thumbnail failed", "path", rel, "error", err)
+		writeError(w, http.StatusNotFound, "no_cover", err.Error())
+		return
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	defer func() { _ = f.Close() }()
+	fi, err := f.Stat()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Cache-Control", "private, max-age=3600")
+	w.Header().Set("ETag", `"`+etag+`"`)
+	http.ServeContent(w, r, "", fi.ModTime(), f)
 }
 
 // --- 検索 ---

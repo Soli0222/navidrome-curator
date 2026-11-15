@@ -1,8 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"image"
+	"image/png"
 	"io"
 	"log/slog"
 	"net/http"
@@ -15,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Soli0222/navidrome-curator/internal/config"
+	"github.com/Soli0222/navidrome-curator/internal/cover"
 	"github.com/Soli0222/navidrome-curator/internal/index"
 	"github.com/Soli0222/navidrome-curator/internal/jobs"
 	"github.com/Soli0222/navidrome-curator/internal/library"
@@ -58,6 +62,10 @@ func newTestServer(t *testing.T, auth config.Auth) *testServer {
 	if err != nil {
 		t.Fatal(err)
 	}
+	covers, err := cover.New(rules, filepath.Join(cfg.WorkDir, "cache", "covers"), 0o755, log)
+	if err != nil {
+		t.Fatal(err)
+	}
 	idx := index.New([]index.Source{{Name: "music", Path: source}}, rules, log, index.Hooks{})
 	lm := library.New([]library.Library{{Name: "shared", Path: lib}}, rules, tr, 0o755, log)
 	jm := jobs.New(jobs.Options{
@@ -69,7 +77,7 @@ func newTestServer(t *testing.T, auth config.Auth) *testServer {
 		t.Fatal(err)
 	}
 	s := &Server{
-		Config: cfg, Rules: rules, Index: idx, Libs: lm, Jobs: jm, Trash: tr, Metrics: metrics.New(), Log: log,
+		Config: cfg, Rules: rules, Covers: covers, Index: idx, Libs: lm, Jobs: jm, Trash: tr, Metrics: metrics.New(), Log: log,
 		BaseContext: ctx,
 	}
 	hs := httptest.NewServer(s.Handler())
@@ -199,5 +207,61 @@ func TestBulkCheck(t *testing.T) {
 		if row["status"] != w.status || gotErr != w.err {
 			t.Errorf("row %d = %v, want %v", i, row, w)
 		}
+	}
+}
+
+func TestCoverAndGroupedAlbums(t *testing.T) {
+	ts := newTestServer(t, config.Auth{Mode: config.AuthNone})
+	var b bytes.Buffer
+	if err := png.Encode(&b, image.NewRGBA(image.Rect(0, 0, 500, 500))); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ts.source, "Artist", "Album", "cover.png"), b.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{"Disc 1", "Disc 2"} {
+		p := filepath.Join(ts.source, "Artist", "Box", d)
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(p, "01.flac"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	resp, err := http.Get(ts.URL + "/api/cover?source=music&path=Artist/Album&size=200")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "image/jpeg" || resp.Header.Get("ETag") == "" {
+		t.Fatalf("cover: %d %v", resp.StatusCode, resp.Header)
+	}
+	req, _ := http.NewRequest("GET", ts.URL+"/api/cover?source=music&path=Artist/Album&size=200", nil)
+	req.Header.Set("If-None-Match", resp.Header.Get("ETag"))
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp2.Body.Close()
+	if resp2.StatusCode != http.StatusNotModified {
+		t.Fatalf("conditional request: %d", resp2.StatusCode)
+	}
+	if r, out := ts.do(t, "GET", "/api/cover?source=music&path=Artist/Box/Disc%201", "", nil); r.StatusCode != http.StatusNotFound || out["error"] != "no_cover" {
+		t.Fatalf("no cover: %d %v", r.StatusCode, out)
+	}
+	if r, _ := ts.do(t, "GET", "/api/cover?source=music&path=../x", "", nil); r.StatusCode != http.StatusBadRequest {
+		t.Fatalf("traversal: %d", r.StatusCode)
+	}
+
+	_, out := ts.do(t, "GET", "/api/browse?source=music&path=Artist", "", nil)
+	var box map[string]any
+	for _, d := range out["dirs"].([]any) {
+		if d.(map[string]any)["name"] == "Box" {
+			box = d.(map[string]any)
+		}
+	}
+	if box == nil || len(box["albums"].([]any)) != 2 || box["albums"].([]any)[0].(map[string]any)["name"] != "Disc 1" {
+		t.Fatalf("grouped albums: %v", box)
 	}
 }
