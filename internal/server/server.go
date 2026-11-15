@@ -21,6 +21,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/Soli0222/navidrome-curator/internal/config"
+	"github.com/Soli0222/navidrome-curator/internal/cover"
 	"github.com/Soli0222/navidrome-curator/internal/index"
 	"github.com/Soli0222/navidrome-curator/internal/jobs"
 	"github.com/Soli0222/navidrome-curator/internal/library"
@@ -34,6 +35,7 @@ import (
 type Server struct {
 	Config  *config.Config
 	Rules   *scan.Rules
+	Covers  *cover.Service
 	Index   *index.Manager
 	Libs    *library.Manager
 	Jobs    *jobs.Manager
@@ -57,6 +59,7 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("POST /api/index/refresh", s.handleIndexRefresh)
 	api.HandleFunc("GET /api/browse", s.handleBrowse)
 	api.HandleFunc("GET /api/compare", s.handleCompare)
+	api.HandleFunc("GET /api/cover", s.handleCover)
 	api.HandleFunc("GET /api/search", s.handleSearch)
 	api.HandleFunc("GET /api/jobs", s.handleJobs)
 	api.HandleFunc("POST /api/jobs", s.handleCreateJobs)

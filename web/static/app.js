@@ -90,16 +90,76 @@ function showError(e) {
   toast(errorText(e.code, e.message), true);
 }
 
+const baseName = (p) => p.split('/').pop();
+const parentPath = (p) => p.split('/').slice(0, -1).join('/');
+
+// 「Album (2019)」を、名前と年に分ける。
+function splitYear(name) {
+  const m = name.match(/^(.*?)\s*[([](\d{4})[)\]]\s*$/);
+  return m ? { title: m[1], year: m[2] } : { title: name, year: '' };
+}
+
+// ---------- ジャケット画像 ----------
+
+// 画像の URL。デモ用のページは window.curatorCoverURL で差し替えられる。
+function coverURL(kind, name, ref, size) {
+  if (typeof window.curatorCoverURL === 'function') return window.curatorCoverURL(kind, name, ref, size);
+  return `/api/cover${qs({ [kind]: name, ref, size })}`;
+}
+
+function hue(s) {
+  let x = 0;
+  for (const c of s) x = (x * 31 + c.codePointAt(0)) >>> 0;
+  return x % 360;
+}
+
+function initials(name) {
+  const { title } = splitYear(name);
+  const words = title.replace(/[^\p{L}\p{N}\s]/gu, ' ').trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return '♪';
+  if (/^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(words[0])) return [...words[0]].slice(0, 2).join('');
+  return words.slice(0, 2).map((w) => [...w][0].toUpperCase()).join('');
+}
+
+function placeholder(name) {
+  const el = h('div', { class: 'cover-ph', 'aria-hidden': 'true' }, h('span', {}, initials(name)));
+  el.style.setProperty('--ph-hue', String(hue(name)));
+  return el;
+}
+
+// cover は画像を読み込み、なければ名前から作った色面に置き換える。
+function cover(kind, name, ref, title, size = 320, eager = false) {
+  const box = h('div', { class: 'cover' });
+  const img = h('img', { loading: eager ? 'eager' : 'lazy', decoding: 'async', alt: '', src: coverURL(kind, name, ref, size) });
+  img.addEventListener('error', () => img.replaceWith(placeholder(title)));
+  box.append(img);
+  return box;
+}
+
+// mosaic はアーティストのアルバムのジャケットを並べる。
+function mosaic(source, refs, name) {
+  const box = h('div', { class: `cover mosaic n${Math.min(refs.length, 4)}` });
+  if (!refs.length) {
+    box.append(placeholder(name));
+    return box;
+  }
+  const list = refs.length >= 4 ? refs.slice(0, 4) : refs.slice(0, 1);
+  for (const r of list) {
+    const img = h('img', { loading: 'lazy', decoding: 'async', alt: '', src: coverURL('source', source, r, 160) });
+    img.addEventListener('error', () => img.replaceWith(placeholder(name)));
+    box.append(img);
+  }
+  return box;
+}
+
 // ---------- 全体の状態 ----------
 
 let status = null;
-const statusListeners = new Set();
 
 async function loadStatus() {
   try {
     status = await api('GET', '/api/status');
     renderIndexStatus();
-    for (const f of statusListeners) f(status);
   } catch (e) {
     if (e.code === 'unauthorized') location.reload();
   }
@@ -126,7 +186,19 @@ function activeJobs() {
   return (status.jobs.queued || 0) + (status.jobs.running || 0);
 }
 
-// ---------- 共通の部品 ----------
+// ---------- 状態の表示 ----------
+
+// albumStatus はアルバムの状態を1つにまとめる。カードの帯と色に使う。
+function albumStatus(state, differs) {
+  const running = state.jobs.filter((j) => j.status === 'running').map((j) => j.library);
+  const queued = state.jobs.filter((j) => j.status === 'queued').map((j) => j.library);
+  const diff = (differs || []).filter((l) => state.libraries.includes(l));
+  if (running.length) return { kind: 'run', text: t('ribbon.running'), libs: running };
+  if (queued.length) return { kind: 'queue', text: t('ribbon.queued'), libs: queued };
+  if (diff.length) return { kind: 'warn', text: t('ribbon.differs'), libs: diff };
+  if (state.libraries.length) return { kind: 'ok', text: t('ribbon.added'), libs: state.libraries };
+  return { kind: 'none', text: t('status.notAdded'), libs: [] };
+}
 
 function stateBadges(state, isAlbum, differs) {
   const out = [];
@@ -148,6 +220,60 @@ function stateBadges(state, isAlbum, differs) {
   return h('div', { class: 'badges' }, out);
 }
 
+// ---------- 選択 ----------
+
+// Selection は、カードで選んだものを持つ。キーは任意の文字列、値は依頼に使うもの。
+class Selection {
+  constructor(onChange) {
+    this.items = new Map();
+    this.boxes = new Map(); // key -> [checkbox]
+    this.onChange = onChange;
+  }
+
+  has(key) { return this.items.has(key); }
+
+  get size() { return this.items.size; }
+
+  set(key, value, on) {
+    if (on) this.items.set(key, value); else this.items.delete(key);
+    for (const b of this.boxes.get(key) || []) {
+      b.checked = on;
+      b.closest('.card')?.classList.toggle('selected', on);
+    }
+    this.onChange();
+  }
+
+  clear() {
+    for (const k of [...this.items.keys()]) this.set(k, null, false);
+  }
+
+  // checkbox はカードに付けるチェックボックスを作る。
+  checkbox(key, value, label, disabled = false) {
+    const box = h('input', {
+      type: 'checkbox', checked: this.has(key), disabled, 'aria-label': label,
+      onchange: (e) => this.set(key, value, e.target.checked),
+    });
+    if (!this.boxes.has(key)) this.boxes.set(key, []);
+    this.boxes.get(key).push(box);
+    return h('label', { class: 'pick', title: label }, box);
+  }
+
+  resetBoxes() { this.boxes.clear(); }
+}
+
+// actionBar は画面の下に固定する、選んだものへの操作。
+function actionBar(sel, ...controls) {
+  const count = h('span', { class: 'count' });
+  const clearBtn = h('button', { class: 'link', onclick: () => sel.clear() }, t('common.clearSelection'));
+  const bar = h('div', { class: 'actionbar' }, h('div', { class: 'actionbar-inner' }, count, clearBtn, h('span', { class: 'grow' }), ...controls));
+  const update = () => {
+    count.textContent = t('add.selected', { n: sel.size });
+    bar.classList.toggle('empty', sel.size === 0);
+  };
+  update();
+  return { el: bar, update };
+}
+
 // libPicker は追加先を選ぶ部品。useDefaults が真なら「source の既定」を選べる。
 function libPicker({ libraries, defaults = [], useDefaults = false }) {
   const boxes = new Map();
@@ -163,7 +289,7 @@ function libPicker({ libraries, defaults = [], useDefaults = false }) {
   for (const name of libraries) {
     const b = h('input', { type: 'checkbox', checked: defaults.includes(name), disabled: useDefaults });
     boxes.set(name, b);
-    el.append(h('label', {}, b, name));
+    el.append(h('label', { class: 'chip' }, b, name));
   }
   return {
     el,
@@ -205,18 +331,72 @@ async function submitJobs(items, libraries) {
   }
 }
 
-function selectAllBox(getBoxes) {
-  return h('input', {
-    type: 'checkbox', title: t('common.selectAll'),
-    onchange: (ev) => {
-      for (const b of getBoxes()) {
-        if (!b.disabled) {
-          b.checked = ev.target.checked;
-          b.dispatchEvent(new Event('change'));
-        }
-      }
+// ---------- カード ----------
+
+// albumCard はジャケット付きのアルバムのカード。update で状態だけを差し替えられる。
+function albumCard({ kind, name, path, ref, label, href, sel, selValue, state, differs, meta, extraRibbon }) {
+  const { title, year } = splitYear(label);
+  const ribbon = h('div', { class: 'ribbon' });
+  const libsEl = h('div', { class: 'card-libs' });
+  const card = h('div', { class: 'card album' });
+  const coverLink = href
+    ? h('a', { class: 'cover-link', href, title: path }, cover(kind, name, ref, label), ribbon)
+    : h('div', { class: 'cover-link', title: path }, cover(kind, name, ref, label), ribbon);
+  card.append(
+    coverLink,
+    sel ? sel.checkbox(`${name}\u0000${ref}`, selValue, label) : '',
+    h('div', { class: 'card-body' },
+      href ? h('a', { class: 'card-title', href, title: label }, title) : h('div', { class: 'card-title', title: label }, title),
+      h('div', { class: 'card-sub' }, [year, meta].filter(Boolean).join(' · ')),
+      libsEl),
+  );
+  if (sel?.has(`${name}\u0000${ref}`)) card.classList.add('selected');
+  const update = (st, diff) => {
+    if (extraRibbon) {
+      ribbon.className = `ribbon ${extraRibbon.kind}`;
+      ribbon.textContent = extraRibbon.text;
+      libsEl.replaceChildren();
+      return;
+    }
+    const s = albumStatus(st, diff);
+    ribbon.className = `ribbon ${s.kind}`;
+    ribbon.textContent = s.kind === 'none' ? '' : s.text;
+    card.dataset.status = s.kind;
+    libsEl.replaceChildren(...st.libraries.map((l) => h('span', {
+      class: (diff || []).includes(l) ? 'lib-chip warn' : 'lib-chip',
+    }, l)), ...(st.sameIn.length ? [h('span', { class: 'lib-chip info', title: t('status.sameIn', { sources: st.sameIn.join(', ') }) }, `≡ ${st.sameIn.join(', ')}`)] : []));
+  };
+  update(state || { libraries: [], jobs: [], sameIn: [] }, differs);
+  return { el: card, update };
+}
+
+function intro(key) {
+  return h('p', { class: 'intro' }, t(key));
+}
+
+// searchForm は置き場のアルバムを探す入力欄。結果は検索の画面に出す。
+function searchForm(q = '') {
+  const input = h('input', { type: 'search', id: 'search-q', value: q, placeholder: t('search.placeholder'), 'aria-label': t('search.submit') });
+  const form = h('form', {
+    class: 'search-form',
+    role: 'search',
+    onsubmit: (e) => {
+      e.preventDefault();
+      const v = input.value.trim();
+      if (v) location.hash = `#/search${qs({ q: v })}`;
     },
-  });
+  }, input, h('button', { type: 'submit' }, t('search.submit')));
+  return { form, input };
+}
+
+function grid(cards) {
+  return h('div', { class: 'grid' }, cards);
+}
+
+function section(titleEl, sub, body, actions) {
+  return h('section', { class: 'group' },
+    h('div', { class: 'group-head' }, h('h3', {}, titleEl), sub ? h('span', { class: 'muted small' }, sub) : '', h('span', { class: 'grow' }), actions || ''),
+    body);
 }
 
 // ---------- 閲覧 ----------
@@ -227,26 +407,39 @@ function viewBrowse(root, params) {
   const source = params.get('source') || sources[0]?.source;
   const ref = params.get('ref') || '';
   const srcInfo = sources.find((s) => s.source === source);
-  const selected = new Map(); // ref -> path
-  const differs = new Map(); // ref -> [library]
+  const differs = new Map();
   const compared = new Set();
+  const cards = new Map(); // ref -> [update]
   let data = null;
-  let picker = null;
+  let filter = '';
+
+  const picker = libPicker({ libraries: srcInfo?.allowedLibraries || [], defaults: srcInfo?.defaultLibraries || [] });
+  const sel = new Selection(() => bar.update());
+  const bar = actionBar(sel, picker.el, h('button', {
+    class: 'primary',
+    onclick: async () => {
+      const res = await submitJobs([...sel.items.values()], picker.value());
+      if (res) {
+        sel.clear();
+        refresh();
+      }
+    },
+  }, t('add.submit')));
 
   const header = h('div', { class: 'toolbar' });
-  const albumPanel = h('div');
-  const listPanel = h('div', { class: 'panel' });
-  const filesPanel = h('div');
-  root.replaceChildren(header, albumPanel, listPanel, filesPanel);
+  const body = h('div');
+  const search = searchForm();
+  root.replaceChildren(h('div', { class: 'view-head' }, intro('intro.browse'), search.form), header, body, bar.el);
 
   const srcSelect = h('select', {
+    'aria-label': t('browse.source'),
     onchange: (e) => { location.hash = `#/browse${qs({ source: e.target.value })}`; },
   }, sources.map((s) => h('option', { value: s.source, selected: s.source === source }, s.source)));
 
   function renderHeader() {
-    const crumbs = h('div', { class: 'crumbs' });
+    const crumbs = h('nav', { class: 'crumbs', 'aria-label': 'breadcrumb' });
     (data?.breadcrumbs || [{ name: source, ref: '' }]).forEach((c, i) => {
-      if (i > 0) crumbs.append(h('span', { class: 'sep' }, '/'));
+      if (i > 0) crumbs.append(h('span', { class: 'sep' }, '›'));
       crumbs.append(h('a', { href: `#/browse${qs({ source, ref: c.ref })}` }, c.name));
     });
     header.replaceChildren(
@@ -265,24 +458,116 @@ function viewBrowse(root, params) {
     );
   }
 
-  async function compare(entryRef) {
-    if (compared.has(entryRef)) return;
+  function register(r, update) {
+    if (!cards.has(r)) cards.set(r, []);
+    cards.get(r).push(update);
+  }
+
+  async function compare(entryRef, state) {
+    if (compared.has(entryRef) || !state.libraries.length) return;
     compared.add(entryRef);
     try {
       const res = await api('GET', `/api/compare${qs({ source, ref: entryRef })}`);
       differs.set(entryRef, res.libraries.filter((l) => l.differs).map((l) => l.library));
-      if (entryRef === ref) renderAlbum(res);
-      if (!stopped) renderList();
+      if (entryRef === ref && data?.isAlbum) renderAlbum(res);
+      for (const u of cards.get(entryRef) || []) u(state, differs.get(entryRef));
     } catch {
-      // 比べられなくても一覧は出す。
+      // 比べられなくても表示は続ける。
     }
   }
 
-  function renderAlbum(cmp) {
-    if (!data?.isAlbum || !ref) {
-      albumPanel.replaceChildren();
-      return;
+  function card(a, label) {
+    const c = albumCard({
+      kind: 'source', name: source, path: a.path, ref: a.ref, label,
+      href: `#/browse${qs({ source, ref: a.ref })}`,
+      sel, selValue: { source, ref: a.ref }, state: a.state, differs: differs.get(a.ref),
+    });
+    register(a.ref, (st, diff) => c.update(st, diff ?? differs.get(a.ref)));
+    compare(a.ref, a.state);
+    return c.el;
+  }
+
+  // source の直下: アーティストの一覧
+  function renderArtists() {
+    const albumsHere = data.dirs.filter((d) => d.isAlbum);
+    const artists = data.dirs.filter((d) => !d.isAlbum);
+    const f = filter.toLowerCase();
+    const shown = artists.filter((d) => !f || d.name.toLowerCase().includes(f));
+    const filterInput = h('input', {
+      type: 'search', id: 'artist-filter', value: filter, placeholder: t('browse.filterArtists'),
+      oninput: (e) => {
+        filter = e.target.value;
+        renderArtists();
+        const el = document.getElementById('artist-filter');
+        el.focus();
+        el.setSelectionRange(filter.length, filter.length);
+      },
+    });
+    const tiles = shown.map((d) => {
+      const tile = h('div', { class: 'card artist' },
+        h('a', { class: 'cover-link', href: `#/browse${qs({ source, ref: d.ref })}` }, mosaic(source, d.covers || [], d.name)),
+        sel.checkbox(`${source}\u0000${d.ref}`, { source, ref: d.ref }, d.name),
+        h('div', { class: 'card-body' },
+          h('a', { class: 'card-title', href: `#/browse${qs({ source, ref: d.ref })}`, title: d.name }, d.name),
+          h('div', { class: 'card-sub' }, d.state.albumsTotal >= 0
+            ? t('browse.artistMeta', { n: d.state.albumsTotal, added: d.state.albumsAdded })
+            : ''),
+          d.state.albumsAdded > 0 ? h('div', { class: 'meter', title: t('status.albumsAdded', { added: d.state.albumsAdded, total: d.state.albumsTotal }) }, meterBar(d.state.albumsAdded / Math.max(1, d.state.albumsTotal))) : ''));
+      if (sel.has(`${source}\u0000${d.ref}`)) tile.classList.add('selected');
+      return tile;
+    });
+    body.replaceChildren(
+      section(t('browse.artists'), t('browse.artistsCount', { n: artists.length }),
+        shown.length ? grid(tiles) : h('div', { class: 'muted' }, t('browse.empty')),
+        filterInput),
+      albumsHere.length ? section(t('browse.albums'), '', grid(albumsHere.map((a) => card(a, a.name)))) : '',
+    );
+  }
+
+  // アーティストなど、アルバムでないディレクトリ
+  function renderGroups() {
+    const direct = data.dirs.filter((d) => d.isAlbum);
+    const groups = data.dirs.filter((d) => !d.isAlbum && d.albums?.length);
+    const empty = data.dirs.filter((d) => !d.isAlbum && !d.albums?.length);
+    const total = direct.length + groups.reduce((n, g) => n + g.albums.length, 0);
+    const added = direct.filter((d) => d.state.libraries.length).length
+      + groups.reduce((n, g) => n + g.albums.filter((a) => a.state.libraries.length).length, 0);
+    const selectAll = (list) => h('button', {
+      class: 'link',
+      onclick: () => {
+        const on = !list.every((a) => sel.has(`${source}\u0000${a.ref}`));
+        for (const a of list) sel.set(`${source}\u0000${a.ref}`, { source, ref: a.ref }, on);
+      },
+    }, t('browse.selectSection'));
+    const parts = [
+      h('div', { class: 'page-head' },
+        h('h2', {}, baseName(data.path)),
+        h('div', { class: 'muted' }, t('browse.artistMeta', { n: total, added }))),
+    ];
+    if (direct.length) {
+      parts.push(section(t('browse.albums'), t('browse.albumsCount', { n: direct.length }),
+        grid(direct.map((a) => card(a, a.name))), selectAll(direct)));
     }
+    for (const g of groups) {
+      parts.push(section(
+        h('a', { href: `#/browse${qs({ source, ref: g.ref })}` }, g.name),
+        t('browse.albumsCount', { n: g.albums.length }),
+        grid(g.albums.map((a) => card(a, a.name))),
+        selectAll(g.albums)));
+    }
+    if (empty.length) {
+      parts.push(section(t('browse.otherFolders'), '', h('div', { class: 'folders' },
+        empty.map((d) => h('a', { class: 'folder-chip', href: `#/browse${qs({ source, ref: d.ref })}` }, d.name)))));
+    }
+    if (!direct.length && !groups.length && !empty.length) parts.push(h('div', { class: 'muted' }, t('browse.noAlbums')));
+    body.replaceChildren(...parts);
+  }
+
+  // アルバムの詳細
+  let albumInfo = null;
+  function renderAlbum(cmp) {
+    const { title, year } = splitYear(baseName(data.path));
+    const parent = data.breadcrumbs[data.breadcrumbs.length - 2];
     const albumPicker = libPicker({ libraries: srcInfo?.allowedLibraries || [], defaults: srcInfo?.defaultLibraries || [] });
     const lines = [];
     if (cmp) {
@@ -293,121 +578,99 @@ function viewBrowse(root, params) {
           t('browse.compareLib', { lib: l.library, files: l.stats.files, size: fmtBytes(l.stats.bytes) })));
       }
     }
-    albumPanel.replaceChildren(h('div', { class: 'panel' },
-      h('h3', {}, `${t('browse.thisAlbum')}: ${data.path}`),
+    const tracks = data.files.filter((f) => f.audio);
+    const others = data.files.filter((f) => !f.audio);
+    const subdirs = data.dirs;
+    const info = h('div', { class: 'album-info' },
+      parent ? h('a', { class: 'album-artist', href: `#/browse${qs({ source, ref: parent.ref })}` }, parent.name) : '',
+      h('h2', { class: 'album-title' }, title),
+      h('div', { class: 'muted' }, [year, t('lib.tracks', { n: tracks.length }), cmp ? fmtBytes(cmp.stats.bytes) : ''].filter(Boolean).join(' · ')),
       stateBadges(data.state, true, differs.get(ref)),
       h('div', { class: 'small' }, lines),
-      h('div', { class: 'toolbar' },
+      h('div', { class: 'album-actions' },
         albumPicker.el,
         h('button', {
           class: 'primary',
-          onclick: () => submitJobs([{ source, ref }], albumPicker.value()).then(reload),
-        }, data.state.libraries.length ? `${t('add.submitThis')} / ${t('add.resync')}` : t('add.submitThis')),
-      ),
-    ));
+          onclick: () => submitJobs([{ source, ref }], albumPicker.value()).then(refresh),
+        }, data.state.libraries.length ? `${t('add.submitThis')} / ${t('add.resync')}` : t('add.submitThis'))));
+    const detail = h('div', { class: 'album-detail' },
+      h('div', { class: 'album-cover' }, cover('source', source, ref, baseName(data.path), 640, true)),
+      info);
+    albumInfo = info;
+    const trackTable = h('div', { class: 'panel' },
+      h('h3', {}, t('browse.tracks')),
+      h('table', { class: 'tracks' },
+        h('tbody', {}, tracks.map((f, i) => h('tr', {},
+          h('td', { class: 'num muted' }, String(i + 1)),
+          h('td', {}, f.name),
+          h('td', { class: 'num muted' }, fmtBytes(f.size)))))),
+      others.length || subdirs.length
+        ? h('div', { class: 'small muted extra-files' },
+          `${t('browse.otherFiles')}: `, [...subdirs.map((d) => `${d.name}/`), ...others.map((f) => f.name)].join(', '))
+        : '');
+    body.replaceChildren(detail, trackTable);
   }
 
-  function renderList() {
+  function render() {
+    renderHeader();
+    cards.clear();
+    sel.resetBoxes();
     if (!data) {
-      listPanel.replaceChildren(h('div', { class: 'muted' }, t('browse.loading')));
+      body.replaceChildren(h('div', { class: 'muted' }, t('browse.loading')));
       return;
     }
-    if (!picker) picker = libPicker({ libraries: srcInfo?.allowedLibraries || [], defaults: srcInfo?.defaultLibraries || [] });
-    const boxes = [];
-    const countEl = h('span', { class: 'muted' }, t('add.selected', { n: selected.size }));
-    const rows = data.dirs.map((d) => {
-      const box = h('input', {
-        type: 'checkbox', checked: selected.has(d.ref),
-        onchange: (e) => {
-          if (e.target.checked) selected.set(d.ref, d.path); else selected.delete(d.ref);
-          countEl.textContent = t('add.selected', { n: selected.size });
-        },
-      });
-      boxes.push(box);
-      if (d.isAlbum && d.state.libraries.length) compare(d.ref);
-      return h('tr', {},
-        h('td', { class: 'check' }, box),
-        h('td', {}, h('a', { href: `#/browse${qs({ source, ref: d.ref })}` }, d.name)),
-        h('td', { class: 'muted' }, d.isAlbum ? t('browse.album') : t('browse.folder')),
-        h('td', {}, stateBadges(d.state, d.isAlbum, differs.get(d.ref))),
-      );
-    });
-    listPanel.replaceChildren(
-      h('div', { class: 'toolbar' },
-        picker.el,
-        h('span', { class: 'grow' }),
-        countEl,
-        h('button', {
-          class: 'primary',
-          onclick: async () => {
-            const items = [...selected.keys()].map((r) => ({ source, ref: r }));
-            const res = await submitJobs(items, picker.value());
-            if (res) {
-              selected.clear();
-              reload();
-            }
-          },
-        }, t('add.submit')),
-      ),
-      data.dirs.length
-        ? h('table', {},
-          h('thead', {}, h('tr', {},
-            h('th', { class: 'check' }, selectAllBox(() => boxes)),
-            h('th', {}, t('browse.name')), h('th', {}, t('browse.kind')), h('th', {}, t('browse.state')))),
-          h('tbody', {}, rows))
-        : h('div', { class: 'muted' }, t('browse.empty')),
-    );
-  }
-
-  function renderFiles() {
-    if (!data?.files.length) {
-      filesPanel.replaceChildren();
+    if (data.isAlbum && ref) {
+      bar.el.hidden = true;
+      renderAlbum(null);
+      compared.delete(ref);
+      compare(ref, data.state);
       return;
     }
-    filesPanel.replaceChildren(h('div', { class: 'panel' },
-      h('h3', {}, t('browse.files')),
-      h('table', {},
-        h('thead', {}, h('tr', {}, h('th', {}, t('browse.name')), h('th', { class: 'num' }, t('browse.size')))),
-        h('tbody', {}, data.files.map((f) => h('tr', {},
-          h('td', { class: f.audio ? '' : 'muted' }, f.name),
-          h('td', { class: 'num' }, fmtBytes(f.size))))))));
+    bar.el.hidden = false;
+    if (!ref) renderArtists(); else renderGroups();
   }
 
-  async function reload() {
+  async function load() {
     try {
       data = await api('GET', `/api/browse${qs({ source, ref })}`);
     } catch (e) {
       showError(e);
-      listPanel.replaceChildren(h('div', { class: 'error-text' }, errorText(e.code, e.message)));
+      body.replaceChildren(h('div', { class: 'error-text' }, errorText(e.code, e.message)));
+      return;
+    }
+    if (!stopped) render();
+  }
+
+  // 状態だけを取り直し、カードを差し替える。画像は読み直さない。
+  async function refresh() {
+    let d;
+    try {
+      d = await api('GET', `/api/browse${qs({ source, ref })}`);
+    } catch {
       return;
     }
     if (stopped) return;
-    renderHeader();
-    renderList();
-    renderFiles();
+    data = d;
     if (data.isAlbum && ref) {
-      renderAlbum(null);
-      compared.delete(ref);
-      compare(ref);
-    } else {
-      renderAlbum(null);
+      if (albumInfo) albumInfo.querySelector('.badges')?.replaceWith(stateBadges(data.state, true, differs.get(ref)));
+      return;
+    }
+    if (!ref) {
+      renderArtists();
+      return;
+    }
+    for (const dir of data.dirs) {
+      for (const a of dir.isAlbum ? [dir] : (dir.albums || [])) {
+        for (const u of cards.get(a.ref) || []) u(a.state);
+      }
     }
   }
 
-  renderHeader();
-  renderList();
-  reload();
-  // コピーが進んでいる間は状態を取り直す。
+  render();
+  load();
   const timer = setInterval(() => {
-    if (activeJobs() > 0 || data?.dirs.some((d) => d.state.jobs.length)) {
-      // 状態だけが変わるので、比べた結果は取り直さない。
-      api('GET', `/api/browse${qs({ source, ref })}`).then((d) => {
-        if (stopped) return;
-        data = d;
-        renderList();
-        if (data.isAlbum && ref) renderAlbum(null);
-      }).catch(() => {});
-    }
+    const busy = data && (data.state?.jobs?.length || data.dirs.some((d) => d.state.jobs.length || d.albums?.some((a) => a.state.jobs.length)));
+    if (activeJobs() > 0 || busy) refresh();
   }, 3000);
   return () => {
     stopped = true;
@@ -415,27 +678,39 @@ function viewBrowse(root, params) {
   };
 }
 
+function meterBar(ratio) {
+  const el = h('div');
+  el.style.width = `${Math.round(Math.min(1, ratio) * 100)}%`;
+  return el;
+}
+
 // ---------- 検索 ----------
 
 function viewSearch(root, params) {
   const q = params.get('q') || '';
-  const input = h('input', { type: 'search', value: q, placeholder: t('search.placeholder') });
-  const form = h('form', {
-    class: 'toolbar',
-    onsubmit: (e) => {
-      e.preventDefault();
-      location.hash = `#/search${qs({ q: input.value.trim() })}`;
+  const { form, input } = searchForm(q);
+  const results = h('div');
+  const picker = libPicker({ libraries: status?.libraries || [], useDefaults: true });
+  const sel = new Selection(() => bar.update());
+  const bar = actionBar(sel, picker.el, h('button', {
+    class: 'primary',
+    onclick: async () => {
+      const r = await submitJobs([...sel.items.values()], picker.value());
+      if (r) {
+        sel.clear();
+        load();
+      }
     },
-  }, input, h('button', { class: 'primary', type: 'submit' }, t('search.submit')));
-  const results = h('div', { class: 'panel' });
-  root.replaceChildren(form, results);
+  }, t('add.submit')));
+  root.replaceChildren(
+    h('div', { class: 'view-head' }, intro('intro.search'), form),
+    h('div', { class: 'toolbar' }, h('a', { href: '#/browse' }, `‹ ${t('search.back')}`)),
+    results, bar.el);
   input.focus();
   if (!q) {
-    results.remove();
+    bar.el.hidden = true;
     return () => {};
   }
-  const selected = new Map();
-  const picker = libPicker({ libraries: status?.libraries || [], useDefaults: true });
 
   async function load() {
     let res;
@@ -445,54 +720,49 @@ function viewSearch(root, params) {
       showError(e);
       return;
     }
-    const boxes = [];
-    const countEl = h('span', { class: 'muted' }, t('add.selected', { n: selected.size }));
-    const key = (r) => `${r.source}\u0000${r.ref}`;
-    const rows = res.results.map((r) => {
-      const box = h('input', {
-        type: 'checkbox', checked: selected.has(key(r)),
-        onchange: (e) => {
-          if (e.target.checked) selected.set(key(r), { source: r.source, ref: r.ref }); else selected.delete(key(r));
-          countEl.textContent = t('add.selected', { n: selected.size });
-        },
-      });
-      boxes.push(box);
-      return h('tr', {},
-        h('td', { class: 'check' }, box),
-        h('td', {}, r.source),
-        h('td', { class: 'path' },
-          h('a', { href: `#/browse${qs({ source: r.source, ref: r.ref })}` }, r.path)),
-        h('td', { class: 'muted' }, r.isAlbum ? t('browse.album') : t('browse.folder')),
-        h('td', {}, stateBadges(r.state, r.isAlbum)),
-      );
-    });
-    results.replaceChildren(
-      res.indexReady ? '' : h('div', { class: 'notice' }, t('index.notReady')),
-      res.truncated ? h('div', { class: 'notice' }, t('search.truncated')) : '',
-      h('div', { class: 'toolbar' },
-        picker.el, h('span', { class: 'grow' }), countEl,
-        h('button', {
-          class: 'primary',
-          onclick: async () => {
-            const r = await submitJobs([...selected.values()], picker.value());
-            if (r) {
-              selected.clear();
-              load();
-            }
-          },
-        }, t('add.submit'))),
-      res.results.length
-        ? h('table', {},
-          h('thead', {}, h('tr', {},
-            h('th', { class: 'check' }, selectAllBox(() => boxes)),
-            h('th', {}, t('browse.source')), h('th', {}, t('search.path')),
-            h('th', {}, t('browse.kind')), h('th', {}, t('browse.state')))),
-          h('tbody', {}, rows))
-        : h('div', { class: 'muted' }, t('search.none')),
-    );
+    sel.resetBoxes();
+    const multi = new Set(res.results.map((r) => r.source)).size > 1;
+    const artists = res.results.filter((r) => !r.isAlbum);
+    const albums = res.results.filter((r) => r.isAlbum);
+    // アルバムを、親のディレクトリ（アーティスト）ごとにまとめる。
+    const groups = new Map();
+    for (const a of albums) {
+      const key = `${a.source}\u0000${a.parent}`;
+      if (!groups.has(key)) groups.set(key, { source: a.source, parent: a.parent, items: [] });
+      groups.get(key).items.push(a);
+    }
+    const parts = [];
+    if (!res.indexReady) parts.push(h('div', { class: 'notice' }, t('index.notReady')));
+    if (res.truncated) parts.push(h('div', { class: 'notice' }, t('search.truncated')));
+    if (artists.length) {
+      parts.push(section(t('search.artists'), t('browse.artistsCount', { n: artists.length }), h('div', { class: 'folders' },
+        artists.map((a) => h('a', { class: 'folder-chip', href: `#/browse${qs({ source: a.source, ref: a.ref })}` },
+          a.path, multi ? h('span', { class: 'muted small' }, ` · ${a.source}`) : '',
+          a.state.albumsTotal > 0 ? h('span', { class: 'muted small' }, ` · ${t('status.albumsAdded', { added: a.state.albumsAdded, total: a.state.albumsTotal })}`) : '')))));
+    }
+    for (const g of groups.values()) {
+      parts.push(section(
+        g.parent ? h('a', { href: `#/browse${qs({ source: g.source, ref: parentRef(g.items[0].ref) })}` }, g.parent) : g.source,
+        multi ? g.source : '',
+        grid(g.items.map((a) => albumCard({
+          kind: 'source', name: a.source, path: a.path, ref: a.ref, label: a.name,
+          href: `#/browse${qs({ source: a.source, ref: a.ref })}`,
+          sel, selValue: { source: a.source, ref: a.ref }, state: a.state,
+        }).el))));
+    }
+    if (!artists.length && !albums.length) parts.push(h('div', { class: 'muted' }, t('search.none')));
+    results.replaceChildren(...parts);
   }
   load();
   return () => {};
+}
+
+// parentRef はアルバムの ref から、親のディレクトリの ref をバイト列のまま作る。
+function parentRef(ref) {
+  const bin = atob(ref.replace(/-/g, '+').replace(/_/g, '/'));
+  const i = bin.lastIndexOf('/');
+  if (i <= 0) return '';
+  return btoa(bin.slice(0, i)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
 // ---------- ライブラリ ----------
@@ -500,11 +770,33 @@ function viewSearch(root, params) {
 function viewLibraries(root, params) {
   const name = params.get('name') || status?.libraries?.[0];
   const summary = h('div', { class: 'panel' });
-  const cards = h('div', { class: 'cards' });
-  const albums = h('div', { class: 'panel' });
+  const tabs = h('div', { class: 'cards' });
+  const albums = h('div');
   const trashPanel = h('div', { class: 'panel' });
-  root.replaceChildren(summary, cards, albums, trashPanel);
-  const selected = new Map();
+  const sel = new Selection(() => bar.update());
+  const bar = actionBar(sel, h('button', {
+    class: 'danger',
+    onclick: async () => {
+      if (!sel.size) {
+        toast(t('add.noSelection'), true);
+        return;
+      }
+      if (!confirm(t('lib.deleteConfirm', { n: sel.size, lib: name }))) return;
+      try {
+        const res = await api('POST', `/api/libraries/${encodeURIComponent(name)}/delete`, {
+          items: [...sel.items.values()].map((ref) => ({ ref })),
+        });
+        const ok = res.results.filter((r) => r.result === 'deleted').length;
+        const errs = res.results.filter((r) => r.result === 'error');
+        const lines = [t('lib.deleted', { n: ok })];
+        for (const e of errs.slice(0, 5)) lines.push(`${e.path}: ${errorText(e.error, e.message)}`);
+        toast(lines.join('\n'), errs.length > 0);
+        sel.clear();
+        loadAll();
+      } catch (e) { showError(e); }
+    },
+  }, t('lib.delete')));
+  root.replaceChildren(intro('intro.libraries'), summary, tabs, albums, trashPanel, bar.el);
   let filter = '';
   let onlyOrphan = false;
   let list = null;
@@ -513,26 +805,29 @@ function viewLibraries(root, params) {
     try {
       const res = await api('GET', '/api/libraries');
       const u = res.usage;
-      summary.replaceChildren(h('div', { class: 'toolbar' },
-        u ? h('span', {}, t('lib.usage', { used: fmtBytes(u.used), total: fmtBytes(u.total), free: fmtBytes(u.free) })) : '',
-        h('span', {}, t('lib.trash', { size: fmtBytes(res.trashBytes) })),
-        h('span', { class: 'grow' }),
-        h('button', {
-          class: 'danger', disabled: !res.trashBytes,
-          onclick: async () => {
-            if (!confirm(t('lib.emptyTrashConfirm'))) return;
-            try {
-              await api('POST', '/api/trash/empty');
-              loadAll();
-            } catch (e) { showError(e); }
-          },
-        }, t('lib.emptyTrash'))),
-      h('div', { class: 'small muted' }, t('trash.hintSpace')));
-      cards.replaceChildren(...res.libraries.map((l) => h('div', {
-        class: l.name === name ? 'card active' : 'card',
-        onclick: () => { location.hash = `#/libraries${qs({ name: l.name })}`; },
+      const usedPct = u ? (u.used / Math.max(1, u.total)) : 0;
+      summary.replaceChildren(
+        h('div', { class: 'toolbar' },
+          u ? h('span', {}, t('lib.usage', { used: fmtBytes(u.used), total: fmtBytes(u.total), free: fmtBytes(u.free) })) : '',
+          h('span', {}, t('lib.trash', { size: fmtBytes(res.trashBytes) })),
+          h('span', { class: 'grow' }),
+          h('button', {
+            class: 'danger', disabled: !res.trashBytes,
+            onclick: async () => {
+              if (!confirm(t('lib.emptyTrashConfirm'))) return;
+              try {
+                await api('POST', '/api/trash/empty');
+                loadAll();
+              } catch (e) { showError(e); }
+            },
+          }, t('lib.emptyTrash'))),
+        u ? h('div', { class: 'usage' }, meterBar(usedPct)) : '',
+        h('div', { class: 'small muted' }, t('trash.hintSpace')));
+      tabs.replaceChildren(...res.libraries.map((l) => h('a', {
+        class: l.name === name ? 'card tab active' : 'card tab',
+        href: `#/libraries${qs({ name: l.name })}`,
       },
-      h('div', { class: 'title' }, l.name),
+      h('div', { class: 'card-title' }, l.name),
       h('div', {}, t('lib.albums', { n: l.albums, size: fmtBytes(l.bytes) })),
       h('div', { class: 'small muted' }, t('lib.scannedAt', { time: fmtTime(l.scannedAt) })),
       l.error ? h('div', { class: 'small error-text' }, l.error) : '')));
@@ -540,6 +835,7 @@ function viewLibraries(root, params) {
   }
 
   function renderAlbums() {
+    sel.resetBoxes();
     if (!name) {
       albums.replaceChildren(h('div', { class: 'muted' }, t('lib.select')));
       return;
@@ -550,81 +846,49 @@ function viewLibraries(root, params) {
     }
     const f = filter.toLowerCase();
     const shown = list.albums.filter((a) => (!onlyOrphan || a.orphan) && (!f || a.path.toLowerCase().includes(f)));
-    const boxes = [];
-    const countEl = h('span', { class: 'muted' }, t('add.selected', { n: selected.size }));
+    const orphanCount = list.albums.filter((a) => a.orphan).length;
+    const groups = new Map();
+    for (const a of shown) {
+      const p = parentPath(a.path);
+      if (!groups.has(p)) groups.set(p, []);
+      groups.get(p).push(a);
+    }
     const filterInput = h('input', {
-      type: 'search', value: filter, placeholder: t('lib.filter'),
+      type: 'search', id: 'lib-filter', value: filter, placeholder: t('lib.filter'),
       oninput: (e) => {
         filter = e.target.value;
         renderAlbums();
-        const el = albums.querySelector('input[type="search"]');
+        const el = document.getElementById('lib-filter');
         el.focus();
         el.setSelectionRange(filter.length, filter.length);
       },
     });
-    albums.replaceChildren(
-      h('div', { class: 'toolbar' },
-        h('h2', {}, name),
-        filterInput,
-        h('label', {}, h('input', {
-          type: 'checkbox', checked: onlyOrphan,
-          onchange: (e) => { onlyOrphan = e.target.checked; renderAlbums(); },
-        }), t('lib.onlyOrphan')),
-        h('span', { class: 'grow' }),
-        h('button', { onclick: () => loadAlbums(true) }, t('lib.rescan')),
-        countEl,
-        h('button', {
-          class: 'danger',
-          onclick: async () => {
-            if (!selected.size) {
-              toast(t('add.noSelection'), true);
-              return;
-            }
-            if (!confirm(t('lib.deleteConfirm', { n: selected.size, lib: name }))) return;
-            try {
-              const res = await api('POST', `/api/libraries/${encodeURIComponent(name)}/delete`, {
-                items: [...selected.keys()].map((ref) => ({ ref })),
-              });
-              const ok = res.results.filter((r) => r.result === 'deleted').length;
-              const errs = res.results.filter((r) => r.result === 'error');
-              const lines = [t('lib.deleted', { n: ok })];
-              for (const e of errs.slice(0, 5)) lines.push(`${e.path}: ${errorText(e.error, e.message)}`);
-              toast(lines.join('\n'), errs.length > 0);
-              selected.clear();
-              loadAll();
-            } catch (e) { showError(e); }
-          },
-        }, t('lib.delete'))),
-      shown.length
-        ? h('table', {},
-          h('thead', {}, h('tr', {},
-            h('th', { class: 'check' }, selectAllBox(() => boxes)),
-            h('th', {}, t('search.path')), h('th', { class: 'num' }, t('browse.files')),
-            h('th', { class: 'num' }, t('browse.size')), h('th', {}, t('browse.state')))),
-          h('tbody', {}, shown.map((a) => {
-            const box = h('input', {
-              type: 'checkbox', checked: selected.has(a.ref), disabled: !!a.job,
-              onchange: (e) => {
-                if (e.target.checked) selected.set(a.ref, a.path); else selected.delete(a.ref);
-                countEl.textContent = t('add.selected', { n: selected.size });
-              },
-            });
-            boxes.push(box);
-            const badges = [];
-            if (a.orphan) badges.push(h('span', { class: 'badge warn' }, t('lib.orphan')));
-            else badges.push(h('span', { class: 'badge muted' }, t('lib.sources', { sources: a.sources.join(', ') })));
-            if (a.job) badges.push(h('span', { class: 'badge info' }, t(`jobs.status.${a.job.status}`)));
-            return h('tr', {},
-              h('td', { class: 'check' }, box),
-              h('td', { class: 'path' }, a.sources.length
-                ? h('a', { href: `#/browse${qs({ source: a.sources[0], ref: a.ref })}` }, a.path)
-                : a.path),
-              h('td', { class: 'num' }, `${a.stats.files} (${t('lib.tracks', { n: a.stats.tracks })})`),
-              h('td', { class: 'num' }, fmtBytes(a.stats.bytes)),
-              h('td', {}, h('div', { class: 'badges' }, badges)));
-          })))
-        : h('div', { class: 'muted' }, t('lib.noAlbums')),
-    );
+    const parts = [h('div', { class: 'toolbar' },
+      h('h2', {}, name),
+      filterInput,
+      h('label', { class: 'chip' }, h('input', {
+        type: 'checkbox', checked: onlyOrphan,
+        onchange: (e) => { onlyOrphan = e.target.checked; renderAlbums(); },
+      }), t('lib.onlyOrphan'), orphanCount ? h('span', { class: 'count-pill' }, String(orphanCount)) : ''),
+      h('span', { class: 'grow' }),
+      h('button', { onclick: () => loadAlbums(true) }, t('lib.rescan')))];
+    if (!shown.length) parts.push(h('div', { class: 'muted' }, t('lib.noAlbums')));
+    for (const [artist, items] of groups) {
+      parts.push(section(artist || name, t('browse.albumsCount', { n: items.length }), grid(items.map((a) => {
+        const ribbon = a.job
+          ? { kind: a.job.status === 'running' ? 'run' : 'queue', text: t(`jobs.status.${a.job.status}`) }
+          : (a.orphan ? { kind: 'warn', text: t('lib.orphan') } : null);
+        const href = a.sources.length ? `#/browse${qs({ source: a.sources[0], ref: a.ref })}` : '';
+        const c = albumCard({
+          kind: 'library', name, path: a.path, ref: a.ref, label: baseName(a.path), href,
+          sel: a.job ? null : sel, selValue: a.ref,
+          meta: `${t('lib.tracks', { n: a.stats.tracks })} · ${fmtBytes(a.stats.bytes)}`,
+          extraRibbon: ribbon || { kind: 'none', text: '' },
+        });
+        return c.el;
+      }))));
+    }
+    albums.replaceChildren(...parts);
   }
 
   async function loadAlbums(refresh = false) {
@@ -647,7 +911,7 @@ function viewLibraries(root, params) {
       trashPanel.replaceChildren(
         h('h2', {}, `${t('trash.title')} (${fmtBytes(res.bytes)})`),
         res.entries.length
-          ? h('table', {},
+          ? h('div', { class: 'table-wrap' }, h('table', {},
             h('thead', {}, h('tr', {},
               h('th', {}, t('jobs.library')), h('th', {}, t('search.path')), h('th', {}, t('browse.state')),
               h('th', { class: 'num' }, t('browse.size')), h('th', {}, t('trash.deletedAt')),
@@ -659,7 +923,7 @@ function viewLibraries(root, params) {
               h('td', { class: 'num' }, fmtBytes(e.bytes)),
               h('td', {}, fmtTime(e.deletedAt)),
               h('td', {}, fmtTime(e.expiresAt)),
-              h('td', {},
+              h('td', { class: 'nowrap' },
                 h('button', {
                   onclick: async () => {
                     try {
@@ -678,7 +942,7 @@ function viewLibraries(root, params) {
                       loadAll();
                     } catch (err) { showError(err); }
                   },
-                }, t('trash.remove')))))))
+                }, t('trash.remove'))))))))
           : h('div', { class: 'muted' }, t('trash.empty')),
       );
     } catch (e) { showError(e); }
@@ -703,19 +967,21 @@ function viewJobs(root, params) {
   const filter = params.get('status') || '';
   const statuses = ['', 'queued', 'running', 'completed', 'failed', 'canceled'];
   const select = h('select', {
+    'aria-label': t('jobs.status'),
     onchange: (e) => { location.hash = `#/jobs${qs({ status: e.target.value })}`; },
   }, statuses.map((s) => h('option', { value: s, selected: s === filter }, s ? t(`jobs.status.${s}`) : t('jobs.filter.all'))));
   const countsEl = h('span', { class: 'muted' });
   const table = h('div', { class: 'panel' });
-  root.replaceChildren(h('div', { class: 'toolbar' }, select, countsEl), table);
+  root.replaceChildren(intro('intro.jobs'), h('div', { class: 'toolbar' }, select, countsEl), table);
 
-  // CSP で style 属性を禁じているので、幅は CSSOM で設定する。
-  const bar = (pct) => {
-    const el = h('div');
-    el.style.width = `${pct.toFixed(1)}%`;
-    return el;
-  };
   const badgeClass = { queued: 'info', running: 'warn', completed: 'ok', failed: 'bad', canceled: 'muted' };
+  // 画像は行を作り直しても読み直さないよう、使い回す。
+  const thumbs = new Map();
+  const thumb = (j) => {
+    const key = `${j.source}\u0000${j.ref}`;
+    if (!thumbs.has(key)) thumbs.set(key, cover('source', j.source, j.ref, baseName(j.path), 160));
+    return thumbs.get(key);
+  };
 
   async function load() {
     let res;
@@ -731,16 +997,16 @@ function viewJobs(root, params) {
       table.replaceChildren(h('div', { class: 'muted' }, t('jobs.none')));
       return;
     }
-    table.replaceChildren(h('table', {},
+    table.replaceChildren(h('div', { class: 'table-wrap' }, h('table', { class: 'jobs' },
       h('thead', {}, h('tr', {},
-        h('th', {}, t('jobs.created')), h('th', {}, t('jobs.source')), h('th', {}, t('jobs.path')),
+        h('th', {}), h('th', {}, t('jobs.path')),
         h('th', {}, t('jobs.library')), h('th', {}, t('jobs.status')), h('th', {}, t('jobs.progress')),
-        h('th', {}, t('jobs.actions')))),
+        h('th', {}, t('jobs.created')), h('th', {}, t('jobs.actions')))),
       h('tbody', {}, jobs.map((j) => {
         const pct = j.bytesTotal > 0 ? Math.min(100, (100 * j.bytesDone) / j.bytesTotal) : (j.status === 'completed' ? 100 : 0);
         const progress = (j.status === 'running' || j.bytesTotal > 0)
           ? h('div', {},
-            h('div', { class: 'progress' }, bar(pct)),
+            h('div', { class: 'progress' }, meterBar(pct / 100)),
             h('div', { class: 'small muted' }, t('jobs.progressText', {
               doneSize: fmtBytes(j.bytesDone), totalSize: fmtBytes(j.bytesTotal),
               doneFiles: j.filesDone, totalFiles: j.filesTotal,
@@ -761,10 +1027,12 @@ function viewJobs(root, params) {
             },
           }, t('jobs.retry')));
         }
+        const { title } = splitYear(baseName(j.path));
         return h('tr', {},
-          h('td', { class: 'small' }, fmtTime(j.createdAt)),
-          h('td', {}, j.source),
-          h('td', { class: 'path' }, h('a', { href: `#/browse${qs({ source: j.source, ref: j.ref })}` }, j.path)),
+          h('td', { class: 'thumb' }, thumb(j)),
+          h('td', { class: 'path' },
+            h('a', { class: 'job-title', href: `#/browse${qs({ source: j.source, ref: j.ref })}` }, title),
+            h('div', { class: 'small muted' }, `${j.source} · ${parentPath(j.path)}`)),
           h('td', {}, j.library),
           h('td', {},
             h('div', { class: 'badges' },
@@ -776,8 +1044,9 @@ function viewJobs(root, params) {
                 j.errorCode === 'insufficient_space' ? h('div', {}, h('a', { href: '#/libraries' }, t('lib.emptyTrash'))) : '')
               : ''),
           h('td', {}, progress),
-          h('td', {}, actions));
-      }))));
+          h('td', { class: 'small muted' }, fmtTime(j.createdAt)),
+          h('td', { class: 'nowrap' }, actions));
+      })))));
   }
   load();
   const timer = setInterval(load, 2000);
@@ -787,7 +1056,7 @@ function viewJobs(root, params) {
 // ---------- 一括追加 ----------
 
 function viewBulk(root) {
-  const area = h('textarea', { spellcheck: 'false', placeholder: 'music\tArtist/Album\nmusic\tArtist/Other Album\tshared,alice' });
+  const area = h('textarea', { id: 'bulk-text', spellcheck: 'false', placeholder: 'music\tArtist/Album\nmusic\tArtist/Other Album\tshared,alice' });
   try {
     area.value = sessionStorage.getItem('bulk') || '';
   } catch {
@@ -805,7 +1074,7 @@ function viewBulk(root) {
     }
   });
   const result = h('div');
-  root.replaceChildren(h('div', { class: 'panel' },
+  root.replaceChildren(intro('intro.bulk'), h('div', { class: 'panel' },
     h('p', { class: 'muted' }, t('bulk.help')),
     area,
     h('div', { class: 'toolbar' }, h('button', { class: 'primary', onclick: check }, t('bulk.check')))),
@@ -835,12 +1104,13 @@ function viewBulk(root) {
             if (r) location.hash = '#/jobs';
           },
         }, t('bulk.submit', { n: found.length }))),
-      h('table', {},
+      h('div', { class: 'table-wrap' }, h('table', {},
         h('thead', {}, h('tr', {},
-          h('th', { class: 'num' }, t('bulk.line')), h('th', {}, t('jobs.source')), h('th', {}, t('jobs.path')),
+          h('th', { class: 'num' }, t('bulk.line')), h('th', {}), h('th', {}, t('jobs.source')), h('th', {}, t('jobs.path')),
           h('th', {}, t('jobs.library')), h('th', {}, t('jobs.status')))),
         h('tbody', {}, res.rows.map((r) => h('tr', {},
           h('td', { class: 'num' }, r.line),
+          h('td', { class: 'thumb' }, r.status === 'found' && r.albums === 1 ? cover('source', r.source, r.ref, baseName(r.path), 160) : ''),
           h('td', {}, r.source),
           h('td', { class: 'path' }, r.status === 'found'
             ? h('a', { href: `#/browse${qs({ source: r.source, ref: r.ref })}` }, r.path)
@@ -851,7 +1121,7 @@ function viewBulk(root) {
               h('span', { class: `badge ${cls[r.status]}` }, label[r.status]),
               r.albums > 1 ? h('span', { class: 'badge muted' }, t('bulk.albums', { n: r.albums })) : '',
               r.present.length ? h('span', { class: 'badge info' }, t('bulk.present', { libs: r.present.join(', ') })) : ''),
-            r.error ? h('div', { class: 'small error-text' }, errorText(r.error, r.message), r.message ? ` (${r.message})` : '') : '')))))));
+            r.error ? h('div', { class: 'small error-text' }, errorText(r.error, r.message), r.message ? ` (${r.message})` : '') : ''))))))));
   }
   return () => {};
 }
@@ -860,7 +1130,7 @@ function viewBulk(root) {
 
 const routes = {
   browse: { label: 'nav.browse', view: viewBrowse },
-  search: { label: 'nav.search', view: viewSearch },
+  search: { label: 'nav.search', view: viewSearch, navAs: 'browse' },
   libraries: { label: 'nav.libraries', view: viewLibraries },
   jobs: { label: 'nav.jobs', view: viewJobs },
   bulk: { label: 'nav.bulk', view: viewBulk },
@@ -876,9 +1146,12 @@ function parseHash() {
 
 function renderNav(active) {
   const nav = document.getElementById('nav');
-  nav.replaceChildren(...Object.entries(routes).map(([name, r]) => h('a', {
-    href: `#/${name}`, class: name === active ? 'active' : '',
-  }, t(r.label))));
+  const current = routes[active]?.navAs || active;
+  nav.replaceChildren(...Object.entries(routes).filter(([, r]) => !r.navAs).map(([name, r]) => {
+    const a = h('a', { href: `#/${name}`, class: name === current ? 'active' : '' }, t(r.label));
+    if (name === 'jobs' && activeJobs() > 0) a.append(h('span', { class: 'nav-pill' }, String(activeJobs())));
+    return a;
+  }));
 }
 
 function route() {
@@ -886,6 +1159,7 @@ function route() {
   const { name, params } = parseHash();
   renderNav(name);
   const view = document.getElementById('view');
+  window.scrollTo(0, 0);
   cleanup = routes[name].view(view, params) || (() => {});
 }
 
@@ -906,7 +1180,10 @@ async function main() {
   await loadStatus();
   window.addEventListener('hashchange', route);
   route();
-  setInterval(loadStatus, 3000);
+  setInterval(async () => {
+    await loadStatus();
+    renderNav(parseHash().name);
+  }, 3000);
 }
 
 main();

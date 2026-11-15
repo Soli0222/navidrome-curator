@@ -11,10 +11,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/Soli0222/navidrome-curator/internal/config"
+	"github.com/Soli0222/navidrome-curator/internal/cover"
 	"github.com/Soli0222/navidrome-curator/internal/index"
 	"github.com/Soli0222/navidrome-curator/internal/jobs"
 	"github.com/Soli0222/navidrome-curator/internal/library"
@@ -82,6 +84,11 @@ func run(log *slog.Logger) error {
 	tr, err := trash.New(cfg.TrashDir(), dirMode)
 	if err != nil {
 		return fmt.Errorf("trash: %w", err)
+	}
+
+	covers, err := cover.New(rules, filepath.Join(cfg.WorkDir, "cache", "covers"), dirMode, log)
+	if err != nil {
+		return fmt.Errorf("cover cache: %w", err)
 	}
 
 	var srcs []index.Source
@@ -162,6 +169,7 @@ func run(log *slog.Logger) error {
 
 	go idx.Run(ctx, cfg.Index.RefreshInterval.D())
 	go lm.Run(ctx, 10*time.Minute)
+	go covers.RunPrune(ctx, 90*24*time.Hour, 24*time.Hour)
 	go tr.RunPurge(ctx, cfg.Trash.Retention.D(), time.Hour,
 		func(err error) { log.Error("trash purge failed", "error", err) },
 		func(n int) {
@@ -170,7 +178,7 @@ func run(log *slog.Logger) error {
 		})
 
 	srv := &server.Server{
-		Config: cfg, Rules: rules, Index: idx, Libs: lm, Jobs: jm, Trash: tr, Metrics: m, Log: log,
+		Config: cfg, Rules: rules, Covers: covers, Index: idx, Libs: lm, Jobs: jm, Trash: tr, Metrics: m, Log: log,
 		Version: version, Static: web.FS(), BaseContext: ctx,
 	}
 	httpSrv := &http.Server{
