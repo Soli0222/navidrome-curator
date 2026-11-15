@@ -1,0 +1,19 @@
+navidrome-curator をデプロイしました。
+
+{{- if not .Values.config.sources }}
+
+注意: config.sources が空です。アプリは起動時の検査で失敗します。
+{{- end }}
+{{- if not (or .Values.persistence.library.existingClaim .Values.persistence.library.volume) }}
+
+注意: persistence.library が未設定です。/library がコンテナの読み取り専用のファイルシステムになり、起動に失敗します。
+{{- end }}
+{{- if and (eq (toString (dig "auth" "mode" "basic" .Values.config)) "basic") (not .Values.auth.existingSecret) }}
+
+注意: config.auth.mode が basic ですが auth.existingSecret が未設定です。
+パスワードのファイルがないため起動に失敗します。Secret を用意するか、extraEnv で NAVIDROME_CURATOR_AUTH_PASSWORD を渡してください。
+{{- end }}
+
+画面:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "chart.fullname" . }} 8080:{{ .Values.service.port }}
+  http://localhost:8080

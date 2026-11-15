@@ -1,0 +1,164 @@
+{
+  $schema: 'https://docs.renovatebot.com/renovate-schema.json',
+  extends: [
+    'config:recommended',
+    ':dependencyDashboard',
+  ],
+  timezone: 'Asia/Tokyo',
+  rangeStrategy: 'bump',
+  prConcurrentLimit: 20,
+  prHourlyLimit: 10,
+  reviewers: [
+    'Soli0222',
+  ],
+  assignees: [
+    'Soli0222',
+  ],
+  semanticCommits: 'enabled',
+  prCreation: 'immediate',
+  rebaseWhen: 'auto',
+  dependencyDashboard: true,
+  vulnerabilityAlerts: {
+    enabled: true,
+    labels: [
+      'security',
+    ],
+  },
+  'helm-values': {
+    enabled: false,
+  },
+  customManagers: [
+    {
+      customType: 'regex',
+      managerFilePatterns: [
+        '/^\\.github/workflows/.*\\.ya?ml$/',
+      ],
+      matchStrings: [
+        'node-version:\\s*\\[?[\'"]?(?<currentValue>\\d+\\.\\d+\\.\\d+)[\'"]?\\]?',
+      ],
+      depNameTemplate: 'node',
+      datasourceTemplate: 'docker',
+    },
+    {
+      customType: 'regex',
+      managerFilePatterns: [
+        '/^charts/.+/values\\.yaml$/',
+      ],
+      matchStrings: [
+        'repository:\\s*(?<depName>[^\\s]+)\\s+tag:\\s*["\'](?<currentValue>[^"\']+)["\']',
+      ],
+      datasourceTemplate: 'docker',
+      versioningTemplate: 'docker',
+    },
+  ],
+  // chart の image tag を上げたら同じ PR で chart version の patch を上げる。
+  // これが無いと chart-guard の経路 B が成立しない。
+  // experimental な機能なので renovate のバージョン更新時は挙動を確認する。
+  bumpVersions: [
+    {
+      filePatterns: [
+        '{{packageFileDir}}/Chart.yaml',
+      ],
+      matchStrings: [
+        '(?:^|\\n)version:\\s*(?<version>[^\\s]+)',
+      ],
+      bumpType: 'patch',
+    },
+  ],
+  packageRules: [
+    {
+      matchManagers: [
+        'github-actions',
+      ],
+      commitMessageTopic: 'GitHub Action {{depName}}',
+      automerge: true,
+    },
+    {
+      matchManagers: [
+        'docker-compose',
+        'dockerfile',
+      ],
+      matchDepNames: [
+        '!node',
+        '!golang',
+      ],
+      commitMessageTopic: 'Docker {{depName}}',
+      semanticCommitType: 'fix',
+      automerge: true,
+    },
+    {
+      matchDepNames: [
+        'node',
+      ],
+      groupName: 'node',
+      commitMessageTopic: 'Node.js',
+      semanticCommitType: 'fix',
+      automerge: true,
+    },
+    {
+      matchManagers: [
+        'gomod',
+      ],
+      commitMessageTopic: 'Go {{depName}}',
+      semanticCommitType: 'fix',
+      automerge: true,
+    },
+    // Go のバージョンは go.mod の go directive (gomod) と Dockerfile のビルド用
+    // ベースイメージ (dockerfile) の 2 箇所にある。別々の PR で上がると go.mod だけ
+    // 先に merge されて Dockerfile が 1 つ前のまま取り残され、golang イメージは
+    // GOTOOLCHAIN=local なので release の docker build が
+    // "go.mod requires go >= X (running go Y; GOTOOLCHAIN=local)" で落ちる。
+    // 同じ groupName にまとめて必ず 1 PR で両方上げる。
+    // matchManagers: ['gomod'] のルールより後に置くこと (後勝ちで上書きされるため)。
+    // 片方の版が未公開で PR が go.mod だけになる可能性は残るので、
+    // 最終的な担保は test.yaml の go-version-guard が行う。
+    {
+      matchDepNames: [
+        'go',
+        'toolchain',
+        'golang',
+      ],
+      groupName: 'golang version',
+      commitMessageTopic: 'Go version',
+      semanticCommitType: 'fix',
+      automerge: true,
+    },
+    {
+      matchManagers: [
+        'custom.regex',
+      ],
+      matchFileNames: [
+        'charts/**/values.yaml',
+      ],
+      commitMessageTopic: 'Chart image {{depName}}',
+      // fix(chart) だと release-please がアプリのリリースとして拾ってしまい、
+      // コードが1行も変わっていないのに依存イメージのタグを上げただけで
+      // アプリのリリースが発生する。chart の変更は chart の publish だけで完結させる。
+      semanticCommitType: 'chore',
+      semanticCommitScope: 'chart',
+      addLabels: [
+        'chart',
+      ],
+      // 経路 B (image tag だけの変更 + chart version の patch bump)。
+      // chart-guard が分類を強制するので automerge して良い。
+      automerge: true,
+      automergeType: 'pr',
+      platformAutomerge: false,
+    },
+    {
+      matchManagers: [
+        'custom.regex',
+      ],
+      matchFileNames: [
+        'charts/**/values.yaml',
+      ],
+      matchUpdateTypes: [
+        'major',
+      ],
+      automerge: false,
+      addLabels: [
+        'major-update',
+      ],
+    },
+  ],
+}

@@ -1,0 +1,121 @@
+image:
+  repository: ghcr.io/soli0222/navidrome-curator
+  # 空なら Chart の appVersion を使う。
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# アプリの設定（README の「設定」を参照）。そのまま ConfigMap にする。
+# source の path は persistence.sources のマウント先（/source/<name>）に、
+# library の path と workDir は persistence.library のマウント先（/library）の下に合わせる。
+config:
+  listen: ":8080"
+  sources: []
+  #  - name: music
+  #    path: /source/music
+  #    defaultLibraries: [shared]
+  libraryRoot: /library
+  libraries: []
+  #  - name: shared
+  #    path: /library/shared
+  workDir: /library/.curator
+  auth:
+    mode: basic
+    basic:
+      username: admin
+      passwordFile: /etc/navidrome-curator/auth/password
+
+# Basic 認証のパスワードを持つ Secret。config.auth.mode が basic のときに使う。
+auth:
+  existingSecret: ""
+  passwordKey: password
+
+persistence:
+  # source の一覧。/source/<name> に読み取り専用でマウントする。
+  # 各要素は existingClaim か、任意の volume 定義（Pod の volumes の1要素から name を除いたもの）を持つ。
+  sources: []
+  #  - name: music
+  #    existingClaim: nas-music
+  #  - name: archive
+  #    volume:
+  #      nfs:
+  #        server: 192.0.2.10
+  #        path: /export/music
+  # /library にマウントする。existingClaim か volume のどちらかを指定する。
+  library:
+    existingClaim: ""
+    volume: {}
+
+service:
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+  loadBalancerIP: ""
+  loadBalancerClass: ""
+  externalTrafficPolicy: ""
+  ipFamilyPolicy: ""
+  ipFamilies: []
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: navidrome-curator.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+serviceMonitor:
+  enabled: false
+  namespace: ""
+  labels: {}
+  annotations: {}
+  interval: ""
+  scrapeTimeout: ""
+  relabelings: []
+  metricRelabelings: []
+
+podSecurityContext:
+  runAsUser: 1000
+  runAsGroup: 1000
+  runAsNonRoot: true
+  fsGroup: 1000
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  periodSeconds: 20
+  timeoutSeconds: 5
+
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: http
+  periodSeconds: 10
+  timeoutSeconds: 8
+
+# Basic 認証のパスワードなどを環境変数で足すときに使う。
+extraEnv: []
+
+resources: {}
+nodeSelector: {}
+affinity: {}
+tolerations: []
+podLabels: {}
+podAnnotations: {}

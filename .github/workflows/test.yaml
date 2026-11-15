@@ -1,0 +1,140 @@
+name: Test
+
+on:
+  push:
+    branches:
+      - '*'
+  pull_request:
+    branches:
+      - '*'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6.0.3
+
+      - name: Set up Go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run tests
+        run: go test -v -race -coverprofile=coverage.out ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6.0.3
+
+      - name: Set up Go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v9.2.1
+
+  # 画面はビルドせずに embed するので、構文の誤りだけはここで止める。
+  ui-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6.0.3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6.4.0
+        with:
+          node-version: '25.9.0'
+
+      - name: Check JavaScript syntax
+        run: |
+          set -euo pipefail
+          for f in web/static/*.js; do
+            node --check "$f"
+          done
+
+      - name: Check that both languages have the same keys
+        run: |
+          node --input-type=module -e "
+            import { messages } from './web/static/i18n.js';
+            const langs = Object.keys(messages);
+            const base = new Set(Object.keys(messages[langs[0]]));
+            let ok = true;
+            for (const l of langs) {
+              const keys = new Set(Object.keys(messages[l]));
+              for (const k of base) if (!keys.has(k)) { console.error(l + ' lacks ' + k); ok = false; }
+              for (const k of keys) if (!base.has(k)) { console.error(langs[0] + ' lacks ' + k); ok = false; }
+            }
+            if (!ok) process.exit(1);
+          "
+
+  # go.mod の go directive と Dockerfile のビルド用 golang イメージがずれていると、
+  # golang イメージは GOTOOLCHAIN=local なので release の docker build が
+  # "go.mod requires go >= X (running go Y; GOTOOLCHAIN=local)" で落ちる。
+  # test.yaml は setup-go で go.mod を見るだけなのでこのズレを検知できない。
+  go-version-guard:
+    name: Guard Go version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6.0.3
+
+      - name: Check go.mod and Dockerfile agree on the Go version
+        run: |
+          set -euo pipefail
+          gomod_version="$(sed -n 's/^go \([0-9][0-9.]*\)[[:space:]]*$/\1/p' go.mod)"
+          image_version="$(sed -n 's|^FROM .*golang:\([0-9][0-9.]*\)-.*|\1|p' Dockerfile)"
+
+          if [ -z "$gomod_version" ]; then
+            echo "::error file=go.mod::go directive を読み取れませんでした"
+            exit 1
+          fi
+          if [ -z "$image_version" ]; then
+            echo "::error file=Dockerfile::golang ベースイメージのタグを読み取れませんでした"
+            exit 1
+          fi
+          if [ "$(printf '%s\n' "$image_version" | wc -l)" -ne 1 ]; then
+            echo "::error file=Dockerfile::golang ベースイメージが複数あります: $image_version"
+            exit 1
+          fi
+
+          echo "go.mod:     $gomod_version"
+          echo "Dockerfile: $image_version"
+
+          if [ "$gomod_version" != "$image_version" ]; then
+            echo "::error file=Dockerfile::Go のバージョンが go.mod ($gomod_version) と Dockerfile ($image_version) でずれています。両方揃えてください。"
+            exit 1
+          fi
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [test, lint, ui-check, go-version-guard]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6.0.3
+
+      - name: Set up Go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Build binary
+        run: CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o navidrome-curator ./cmd/navidrome-curator

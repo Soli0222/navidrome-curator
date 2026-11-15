@@ -1,0 +1,12 @@
+# ビルドの成果物
+/navidrome-curator
+*.test
+*.out
+dist/
+
+# 開発用の compose が使うディレクトリ
+/dev/source/
+/dev/library/
+
+.DS_Store
+.env

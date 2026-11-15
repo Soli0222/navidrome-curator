@@ -1,0 +1,41 @@
+# 開発用。ローカルのディレクトリを source と library にマウントして動かす。
+#
+#   mkdir -p dev/source/music dev/library
+#   UID=$(id -u) GID=$(id -g) docker compose up --build
+#
+# http://localhost:8080 を開く（auth.mode: none）。
+services:
+  navidrome-curator:
+    build: .
+    user: "${UID:-1000}:${GID:-1000}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    ports:
+      - "8080:8080"
+    environment:
+      TMPDIR: /tmp
+    command: ["-config", "/etc/navidrome-curator/config.yaml"]
+    volumes:
+      - ./dev/config.yaml:/etc/navidrome-curator/config.yaml:ro
+      - ${SOURCE_DIR:-./dev/source/music}:/source/music:ro
+      - ${LIBRARY_DIR:-./dev/library}:/library
+    tmpfs:
+      - /tmp
+
+  # 取り込みの確認用。library を読み取り専用でマウントする。
+  navidrome:
+    image: deluan/navidrome:0.58.5
+    profiles: [navidrome]
+    user: "${UID:-1000}:${GID:-1000}"
+    ports:
+      - "4533:4533"
+    environment:
+      ND_MUSICFOLDER: /music
+      ND_SCANSCHEDULE: 1m
+    volumes:
+      - ${LIBRARY_DIR:-./dev/library}/shared:/music:ro
+      - navidrome-data:/data
+
+volumes:
+  navidrome-data:

@@ -1,0 +1,7 @@
+.git
+.github
+charts
+dev
+*.md
+!README.md
+compose.yaml

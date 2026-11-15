@@ -1,0 +1,8 @@
+apiVersion: v2
+name: navidrome-curator
+description: Copy selected albums from a music archive into a music server library
+type: application
+sources:
+  - https://github.com/Soli0222/navidrome-curator
+version: 0.1.0
+appVersion: 0.0.0

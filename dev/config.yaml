@@ -1,0 +1,21 @@
+# compose.yaml から使う開発用の設定。
+listen: ":8080"
+sources:
+  - name: music
+    path: /source/music
+    defaultLibraries: [shared]
+libraryRoot: /library
+libraries:
+  - name: shared
+    path: /library/shared
+  - name: alice
+    path: /library/alice
+workDir: /library/.curator
+copy:
+  freeSpaceMargin: 100MiB
+index:
+  refreshInterval: 10m
+trash:
+  retention: 1h
+auth:
+  mode: none

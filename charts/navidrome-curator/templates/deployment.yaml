@@ -1,0 +1,134 @@
+{{- $lib := .Values.persistence.library }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "chart.fullname" . }}
+  labels:
+    {{- include "chart.labels" . | nindent 4 }}
+spec:
+  # ジョブの状態をプロセスの中に持つため、1つに固定する。
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "chart.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "chart.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - -config
+            - /etc/navidrome-curator/config.yaml
+          env:
+            - name: TMPDIR
+              value: /tmp
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ include "chart.containerPort" . }}
+              protocol: TCP
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/navidrome-curator/config.yaml
+              subPath: config.yaml
+              readOnly: true
+            {{- if .Values.auth.existingSecret }}
+            - name: auth
+              mountPath: /etc/navidrome-curator/auth
+              readOnly: true
+            {{- end }}
+            - name: tmp
+              mountPath: /tmp
+            {{- if or $lib.existingClaim $lib.volume }}
+            - name: library
+              mountPath: /library
+            {{- end }}
+            {{- range $i, $s := .Values.persistence.sources }}
+            - name: source-{{ $i }}
+              mountPath: /source/{{ required "persistence.sources[].name is required" $s.name }}
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "chart.fullname" . }}
+        {{- if .Values.auth.existingSecret }}
+        - name: auth
+          secret:
+            secretName: {{ .Values.auth.existingSecret }}
+            defaultMode: 0440
+            items:
+              - key: {{ .Values.auth.passwordKey }}
+                path: password
+        {{- end }}
+        - name: tmp
+          emptyDir: {}
+        {{- if $lib.existingClaim }}
+        - name: library
+          persistentVolumeClaim:
+            claimName: {{ $lib.existingClaim }}
+        {{- else if $lib.volume }}
+        - name: library
+          {{- toYaml $lib.volume | nindent 10 }}
+        {{- end }}
+        {{- range $i, $s := .Values.persistence.sources }}
+        - name: source-{{ $i }}
+          {{- if $s.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ $s.existingClaim }}
+            readOnly: true
+          {{- else if $s.volume }}
+          {{- toYaml $s.volume | nindent 10 }}
+          {{- else }}
+          {{- fail (printf "persistence.sources[%d] (%s) needs existingClaim or volume" $i $s.name) }}
+          {{- end }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
