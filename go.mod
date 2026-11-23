@@ -6,7 +6,7 @@ require (
 	github.com/prometheus/client_golang v1.25.0
 	go.yaml.in/yaml/v4 v4.0.0
 	golang.org/x/image v0.48.0
-	modernc.org/sqlite v1.62.0
+	modernc.org/sqlite v1.63.0
 )
 
 require (
